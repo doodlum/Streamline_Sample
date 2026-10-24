@@ -17,6 +17,8 @@
 #include <ffx_api/ffx_nss.hpp>
 #include <ffx_api/vk/ffx_api_vk.hpp>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -212,7 +214,7 @@ bool NSSWrapper::Configure(nvrhi::IDevice* device, const Settings& settings)
     if (!IsAvailable(device))
         return false;
     if (m_Context && m_HasSettings && all(settings.renderSize == m_Settings.renderSize) && all(settings.displaySize == m_Settings.displaySize) &&
-        settings.quality == m_Settings.quality && settings.depthInverted == m_Settings.depthInverted)
+        settings.quality == m_Settings.quality && settings.depthInverted == m_Settings.depthInverted && settings.depthInfinite == m_Settings.depthInfinite)
         return true;
 
     device->waitForIdle();
@@ -239,7 +241,16 @@ bool NSSWrapper::Configure(nvrhi::IDevice* device, const Settings& settings)
     nssDesc.maxRenderSize  = {uint32_t(settings.renderSize.x), uint32_t(settings.renderSize.y)};
     nssDesc.maxUpscaleSize = {uint32_t(settings.displaySize.x), uint32_t(settings.displaySize.y)};
     nssDesc.flags          = FFX_API_NSS_CONTEXT_FLAG_QUANTIZED | FFX_API_NSS_CONTEXT_FLAG_HIGH_DYNAMIC_RANGE | FFX_API_NSS_CONTEXT_FLAG_MANAGE_HISTORY |
-                    (settings.depthInverted ? FFX_API_NSS_CONTEXT_FLAG_DEPTH_INVERTED : 0u);
+                    (settings.depthInverted ? FFX_API_NSS_CONTEXT_FLAG_DEPTH_INVERTED : 0u) |
+                    (settings.depthInfinite ? FFX_API_NSS_CONTEXT_FLAG_DEPTH_INFINITE : 0u);
+    // NSS_DEPTH_FLAGS="inverted,infinite" (0/1 each) overrides for experiments.
+    if (const char* env = getenv("NSS_DEPTH_FLAGS"))
+    {
+        int inv = 0, inf = 0;
+        sscanf(env, "%d,%d", &inv, &inf);
+        nssDesc.flags &= ~(FFX_API_NSS_CONTEXT_FLAG_DEPTH_INVERTED | FFX_API_NSS_CONTEXT_FLAG_DEPTH_INFINITE);
+        nssDesc.flags |= (inv ? FFX_API_NSS_CONTEXT_FLAG_DEPTH_INVERTED : 0u) | (inf ? FFX_API_NSS_CONTEXT_FLAG_DEPTH_INFINITE : 0u);
+    }
     nssDesc.fpMessage   = OnNssMessage;
     nssDesc.qualityMode = static_cast<FfxApiNssShaderQualityMode>(settings.quality);
 
@@ -285,6 +296,8 @@ void NSSWrapper::EnsureDepthCopy(nvrhi::IDevice* device, donut::math::int2 size)
         nvrhi::BindingLayoutDesc layoutDesc;
         layoutDesc.visibility = nvrhi::ShaderType::Compute;
         layoutDesc.bindings   = {nvrhi::BindingLayoutItem::Texture_SRV(0), nvrhi::BindingLayoutItem::Texture_UAV(0)};
+        // The sample's shaders are compiled with t/b/u register shifts of 200/300/400 for Vulkan.
+        layoutDesc.bindingOffsets.setShaderResourceOffset(200).setConstantBufferOffset(300).setUnorderedAccessViewOffset(400);
         m_DepthCopyLayout     = device->createBindingLayout(layoutDesc);
 
         nvrhi::ComputePipelineDesc pipelineDesc;
@@ -327,14 +340,33 @@ void NSSWrapper::Evaluate(nvrhi::IDevice* device, nvrhi::ICommandList* commandLi
     desc.depth                  = WrapTexture(m_DepthR32, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     desc.motionVectors          = WrapTexture(in.motionVectors, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     desc.output                 = WrapTexture(in.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-    desc.jitterOffset           = {in.jitterOffset.x, in.jitterOffset.y};
+    // NSS's jitter is the negative of donut's pixel offset on both axes (measured: static-scene PSNR vs DLSS
+    // 38 dB with (-1,-1) against 29-32 dB for the other sign combinations). NSS_JITTER_SIGN="sx,sy" overrides.
+    static float jitterSign[2] = {-1.f, -1.f};
+    static bool  jitterSignRead = false;
+    if (!jitterSignRead)
+    {
+        jitterSignRead = true;
+        if (const char* env = getenv("NSS_JITTER_SIGN"))
+            sscanf(env, "%f,%f", &jitterSign[0], &jitterSign[1]);
+    }
+    desc.jitterOffset = {jitterSign[0] * in.jitterOffset.x, jitterSign[1] * in.jitterOffset.y};
     desc.renderSize             = {uint32_t(renderSize.x), uint32_t(renderSize.y)};
     desc.upscaleSize            = {uint32_t(m_Settings.displaySize.x), uint32_t(m_Settings.displaySize.y)};
     desc.cameraNear             = in.cameraNear;
     desc.cameraFar              = in.cameraFar;
     desc.cameraFovAngleVertical = in.cameraFovY;
     desc.exposure               = 1.0f;
-    desc.motionVectorScale      = {1.0f, 1.0f};  // donut motion vectors are already in pixels
+    // donut motion vectors are backward, in render-resolution pixels. NSS_MV_SCALE="sx,sy" overrides for experiments.
+    static float mvScale[2] = {1.f, 1.f};
+    static bool  mvScaleRead = false;
+    if (!mvScaleRead)
+    {
+        mvScaleRead = true;
+        if (const char* env = getenv("NSS_MV_SCALE"))
+            sscanf(env, "%f,%f", &mvScale[0], &mvScale[1]);
+    }
+    desc.motionVectorScale = {mvScale[0], mvScale[1]};
     desc.frameTimeDelta         = in.frameTimeMs;
     desc.reset                  = in.reset;
     (void)colorDesc;

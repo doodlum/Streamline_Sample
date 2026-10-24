@@ -106,6 +106,8 @@ struct ScriptingConfig {
     int captureWarmup = 30;
     int referenceSamples = 0;
     float captureExposure = 0.12f;
+    bool captureStatic = false;     // -captureStatic: camera and animations frozen at the start of the path
+    bool freezeAnimation = false;   // -freezeAnimation: scene animations frozen, camera still moves
 
     ScriptingConfig(int argc, const char* const* argv)
     {
@@ -200,6 +202,14 @@ struct ScriptingConfig {
             {
                 referenceSamples = std::stoi(argv[++i]);
             }
+            else if (!strcmp(argv[i], "-freezeAnimation"))
+            {
+                freezeAnimation = true;
+            }
+            else if (!strcmp(argv[i], "-captureStatic"))
+            {
+                captureStatic = true;
+            }
             else if (!strcmp(argv[i], "-exposure"))
             {
                 captureExposure = std::stof(argv[++i]);
@@ -259,6 +269,7 @@ private:
     nvrhi::ComputePipelineHandle                    m_ResolvePipeline;
     nvrhi::TextureHandle                            m_ReferenceAccum;
     int                                             m_CaptureAppFrame = 0;   // frames rendered since the scene loaded
+    uint32_t                                        m_UpscalerJitterFrame = 0;  // index into the shared DLSS/NSS jitter sequence
     bool IsCapturing() const { return !m_ScriptingConfig.captureDir.empty(); }
     int  CaptureSamples() const { return m_ScriptingConfig.referenceSamples > 0 ? m_ScriptingConfig.referenceSamples : 1; }
     int  CapturePathFrame() const { return m_CaptureAppFrame / CaptureSamples(); }

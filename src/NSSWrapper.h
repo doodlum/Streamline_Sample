@@ -34,6 +34,7 @@ public:
         donut::math::int2 displaySize;
         int               quality       = 1;  // 0 = Quality, 1 = Balanced, 2 = Performance (network size)
         bool              depthInverted = true;
+        bool              depthInfinite = false;  // infinite far plane (donut's perspProjD3DStyleReverse)
     };
 
     struct Inputs
@@ -62,6 +63,7 @@ public:
 
     // e.g. "NSS Balanced: NVIDIA GeForce RTX 4080: coopmat int8 16x16x32" (from the SDK log)
     const std::string& GetStatus() const { return m_Status; }
+    nvrhi::ITexture*   GetDepthCopy() const { return m_DepthR32; }
 
 private:
     NSSWrapper() = default;

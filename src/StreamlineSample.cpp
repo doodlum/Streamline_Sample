@@ -163,6 +163,8 @@ StreamlineSample::StreamlineSample(
         nvrhi::BindingLayoutDesc layoutDesc;
         layoutDesc.visibility = nvrhi::ShaderType::Compute;
         layoutDesc.bindings   = { nvrhi::BindingLayoutItem::Texture_SRV(0), nvrhi::BindingLayoutItem::Texture_UAV(0) };
+        // Same Vulkan register shifts as the sample's other shaders (t200 / b300 / u400).
+        layoutDesc.bindingOffsets.setShaderResourceOffset(200).setConstantBufferOffset(300).setUnorderedAccessViewOffset(400);
         m_AccumulateLayout    = GetDevice()->createBindingLayout(layoutDesc);
 
         auto makePipeline = [&](nvrhi::ShaderHandle shader) {
@@ -593,6 +595,17 @@ bool StreamlineSample::SetupView()
     if (m_TemporalAntiAliasingPass) m_TemporalAntiAliasingPass->SetJitter(m_ui.TemporalAntiAliasingJitter);
 
     float2 pixelOffset = m_ui.AAMode != AntiAliasingMode::NONE && m_TemporalAntiAliasingPass ? m_TemporalAntiAliasingPass->GetCurrentPixelOffset() : float2(0.f);
+
+    // DLSS and NSS share one jitter sequence: Halton(2,3) over 8 * scale^2 phases, as both SDKs recommend
+    // (donut's own Halton only cycles 16 phases, too few for 2x upscaling).
+    if ((m_ui.AAMode == AntiAliasingMode::DLSS || m_ui.AAMode == AntiAliasingMode::NSS) &&
+        m_ui.TemporalAntiAliasingJitter == donut::render::TemporalAntiAliasingJitter::Halton && m_RenderingRectSize.x > 0)
+    {
+        const float ratio  = float(m_DisplaySize.x) / float(m_RenderingRectSize.x);
+        const int   phases = dm::max(int(8.f * ratio * ratio), 1);
+        const int   index  = int(m_UpscalerJitterFrame % uint32_t(phases)) + 1;
+        pixelOffset        = float2(Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f);
+    }
 
     // Ground truth: each subframe samples a different sub-pixel position (Halton 2,3) of the same instant.
     if (IsCapturing() && m_ScriptingConfig.referenceSamples > 0)
@@ -1488,6 +1501,7 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
             settings.displaySize   = m_DisplaySize;
             settings.quality       = m_ui.NSS_Quality;
             settings.depthInverted = m_View->IsReverseDepth();
+            settings.depthInfinite = true;  // perspProjD3DStyleReverse has no far plane
 
             if (NSSWrapper::Get().Configure(GetDevice(), settings))
             {
@@ -1728,6 +1742,7 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
     {
 
         m_TemporalAntiAliasingPass->AdvanceFrame();
+        ++m_UpscalerJitterFrame;
 
         std::swap(m_View, m_ViewPrevious);
 
@@ -1748,6 +1763,47 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
             const std::string path = (std::filesystem::path(m_ScriptingConfig.captureDir) / name).string();
             if (!SaveTextureToFile(GetDevice(), m_CommonPasses.get(), m_RenderTargets->ColorspaceCorrectionColor, nvrhi::ResourceStates::RenderTarget, path.c_str(), false))
                 log::error("Failed to write %s", path.c_str());
+
+            // CAPTURE_DUMP_MV=1: also write the raw RG16F motion vectors (render resolution) for offline checks.
+            auto dumpTexture = [&](nvrhi::ITexture* texture, const char* prefix, uint32_t bytesPerPixel)
+            {
+                const nvrhi::TextureDesc& mvDesc = texture->getDesc();
+                nvrhi::TextureDesc stagingDesc = mvDesc;
+                stagingDesc.isRenderTarget = false;
+                stagingDesc.isUAV = false;
+                stagingDesc.initialState = nvrhi::ResourceStates::CopyDest;
+                nvrhi::StagingTextureHandle staging = GetDevice()->createStagingTexture(stagingDesc, nvrhi::CpuAccessMode::Read);
+                nvrhi::CommandListHandle copyList = GetDevice()->createCommandList();
+                copyList->open();
+                copyList->copyTexture(staging, nvrhi::TextureSlice(), texture, nvrhi::TextureSlice());
+                copyList->close();
+                GetDevice()->executeCommandList(copyList);
+                GetDevice()->waitForIdle();
+                size_t rowPitch = 0;
+                const uint8_t* data = static_cast<const uint8_t*>(GetDevice()->mapStagingTexture(staging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &rowPitch));
+                if (data)
+                {
+                    snprintf(name, sizeof(name), "%s_%04d.bin", prefix, captured);
+                    FILE* f = fopen((std::filesystem::path(m_ScriptingConfig.captureDir) / name).string().c_str(), "wb");
+                    if (f)
+                    {
+                        const uint32_t header[2] = {mvDesc.width, mvDesc.height};
+                        fwrite(header, sizeof(header), 1, f);
+                        for (uint32_t y = 0; y < mvDesc.height; ++y)
+                            fwrite(data + y * rowPitch, bytesPerPixel, mvDesc.width, f);
+                        fclose(f);
+                    }
+                    GetDevice()->unmapStagingTexture(staging);
+                }
+            };
+            if (getenv("CAPTURE_DUMP_MV"))
+            {
+                dumpTexture(m_RenderTargets->MotionVectors, "mv", 4);
+#ifdef ENABLE_NSS
+                if (m_ui.AAMode == AntiAliasingMode::NSS && NSSWrapper::Get().GetDepthCopy())
+                    dumpTexture(NSSWrapper::Get().GetDepthCopy(), "depth", 4);
+#endif
+            }
         }
         ++m_CaptureAppFrame;
         if (CapturePathFrame() >= m_ScriptingConfig.captureWarmup + m_ScriptingConfig.captureFrames)
@@ -1880,7 +1936,7 @@ void StreamlineSample::UpdateCaptureCamera()
 {
     // A fixed walk down the atrium with a gentle sway and pan, parameterised by the capture frame only.
     const int   total = m_ScriptingConfig.captureWarmup + m_ScriptingConfig.captureFrames;
-    const float t     = float(CapturePathFrame()) / float(dm::max(total - 1, 1));
+    const float t     = m_ScriptingConfig.captureStatic ? 0.f : float(CapturePathFrame()) / float(dm::max(total - 1, 1));
     const float x     = -4.0f + 6.0f * t;
     const float3 position(x, 1.8f + 0.15f * std::sin(t * 6.2831853f), 0.6f * std::sin(t * 3.1415926f));
     const float  yaw = 0.35f * std::sin(t * 6.2831853f * 1.5f);
@@ -1909,7 +1965,7 @@ void StreamlineSample::Animate(float fElapsedTimeSeconds)
     {
         m_WallclockTime += fElapsedTimeSeconds*m_ui.AnimationSpeed;
         if (IsCapturing())
-            m_WallclockTime = float(CapturePathFrame()) * kCaptureFrameTime * m_ui.AnimationSpeed;
+            m_WallclockTime = (m_ScriptingConfig.captureStatic || m_ScriptingConfig.freezeAnimation) ? 0.f : float(CapturePathFrame()) * kCaptureFrameTime * m_ui.AnimationSpeed;
 
         for (const auto& anim : m_Scene->GetSceneGraph()->GetAnimations())
         {

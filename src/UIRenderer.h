@@ -498,59 +498,94 @@ protected:
                 "DLAA##DLSSModes"
             });
 
-            ImGui::Text("Super Resolution");
-            ImGui::SameLine();
-            if (!m_ui.DLSS_Supported) pushDisabled();
-            if (!m_ui.DLSS_Supported
-#ifdef STREAMLINE_FEATURE_DLSS_RR
-                || m_ui.DLSSRR_Mode != sl::DLSSMode::eOff
-#endif
-                ) pushDisabled();
-            if (ImGui::BeginCombo("##SuperRes", DLSSModeNames[m_dev_view_dlss_mode].data()))
+            //
+            //  Upscaler: DLSS or Arm NSS (Vulkan). N toggles them at the same render resolution.
+            //
+            if (m_ui.NSS_Supported)
             {
-                for (int i = 0; i < DLSSModeNames.size(); ++i)
-                {
-                    bool is_selected = i == m_dev_view_dlss_mode;
-
-                    if (ImGui::Selectable(DLSSModeNames[i].data(), is_selected)) m_dev_view_dlss_mode = i;
-                    if (is_selected) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-                if (ImGui::IsItemHovered()) m_ui.MouseOverUI = true;
-            }
-#ifdef STREAMLINE_FEATURE_DLSS_RR
-            if (m_ui.DLSSRR_Mode != sl::DLSSMode::eOff)
-            {
+                int upscaler = m_ui.AAMode == AntiAliasingMode::NSS ? 1 : 0;
+                ImGui::Text("Upscaler");
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "(Ray Reconstruction is active)");
+                if (ImGui::Combo("##Upscaler", &upscaler, "DLSS NSS (Arm) "))
+                {
+                    if (upscaler == 1)
+                        m_ui.AAMode = AntiAliasingMode::NSS;
+                    else
+                    {
+                        m_ui.AAMode = AntiAliasingMode::DLSS;
+                        if (m_dev_view_dlss_mode == 0) m_dev_view_dlss_mode = 4;  // Performance = same 2x as NSS
+                    }
+                }
+                if (ImGui::IsItemHovered()) m_ui.MouseOverUI = true;
+                ImGui::SameLine();
+                ImGui::TextDisabled("(N toggles)");
             }
-#endif// STREAMLINE_FEATURE_DLSS_RR
-            if (!m_ui.DLSS_Supported
-#ifdef STREAMLINE_FEATURE_DLSS_RR
+
+            // Switched to DLSS from outside this panel (N key): show it as Performance instead of Off.
+            if (m_ui.AAMode == AntiAliasingMode::DLSS && m_dev_view_dlss_mode == 0) m_dev_view_dlss_mode = 4;
+
+            if (m_ui.AAMode == AntiAliasingMode::NSS)
+            {
+                ImGui::Combo("NSS Quality", &m_ui.NSS_Quality, "Quality Balanced Performance ");
+                ImGui::SliderFloat("NSS Scale", &m_ui.NSS_Scale, 1.0f, 3.0f, "%.2fx");
+                ImGui::TextWrapped("%s", m_ui.NSS_Status.c_str());
+            }
+            else
+            {
+                ImGui::Text("Super Resolution");
+                ImGui::SameLine();
+                if (!m_ui.DLSS_Supported) pushDisabled();
+                if (!m_ui.DLSS_Supported
+    #ifdef STREAMLINE_FEATURE_DLSS_RR
                     || m_ui.DLSSRR_Mode != sl::DLSSMode::eOff
-#endif
-                ) popDisabled();
-            if (!m_ui.DLSS_Supported) popDisabled();
+    #endif
+                    ) pushDisabled();
+                if (ImGui::BeginCombo("##SuperRes", DLSSModeNames[m_dev_view_dlss_mode].data()))
+                {
+                    for (int i = 0; i < DLSSModeNames.size(); ++i)
+                    {
+                        bool is_selected = i == m_dev_view_dlss_mode;
 
-            if (m_dev_view_dlss_mode == 0) m_ui.DLSS_Mode = sl::DLSSMode::eOff;
-            else if (m_dev_view_dlss_mode == 2) m_ui.DLSS_Mode = sl::DLSSMode::eMaxQuality;
-            else if (m_dev_view_dlss_mode == 3) m_ui.DLSS_Mode = sl::DLSSMode::eBalanced;
-            else if (m_dev_view_dlss_mode == 4) m_ui.DLSS_Mode = sl::DLSSMode::eMaxPerformance;
-            else if (m_dev_view_dlss_mode == 5) m_ui.DLSS_Mode = sl::DLSSMode::eUltraPerformance;
-            //else if (m_dev_view_dlss_mode == 6) m_ui.DLSS_Mode = sl::DLSSMode::eUltraQuality;
-            else if (m_dev_view_dlss_mode == 6) m_ui.DLSS_Mode = sl::DLSSMode::eDLAA;
-            else if (m_dev_view_dlss_mode == 1) {
-                if (m_ui.Resolution.x < 1920) m_ui.DLSS_Mode = sl::DLSSMode::eOff;
-                else if (m_ui.Resolution.x < 2560) m_ui.DLSS_Mode = sl::DLSSMode::eMaxQuality;
-                else if (m_ui.Resolution.x < 3840) m_ui.DLSS_Mode = sl::DLSSMode::eMaxPerformance;
-                else m_ui.DLSS_Mode = sl::DLSSMode::eUltraPerformance;
-            }
+                        if (ImGui::Selectable(DLSSModeNames[i].data(), is_selected)) m_dev_view_dlss_mode = i;
+                        if (is_selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                    if (ImGui::IsItemHovered()) m_ui.MouseOverUI = true;
+                }
+    #ifdef STREAMLINE_FEATURE_DLSS_RR
+                if (m_ui.DLSSRR_Mode != sl::DLSSMode::eOff)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "(Ray Reconstruction is active)");
+                }
+    #endif// STREAMLINE_FEATURE_DLSS_RR
+                if (!m_ui.DLSS_Supported
+    #ifdef STREAMLINE_FEATURE_DLSS_RR
+                        || m_ui.DLSSRR_Mode != sl::DLSSMode::eOff
+    #endif
+                    ) popDisabled();
+                if (!m_ui.DLSS_Supported) popDisabled();
 
-            if (m_ui.DLSS_Mode != sl::DLSSMode::eOff) {
-                m_ui.AAMode = AntiAliasingMode::DLSS;
-            }
-            else {
-                m_ui.AAMode = AntiAliasingMode::NONE;
+                if (m_dev_view_dlss_mode == 0) m_ui.DLSS_Mode = sl::DLSSMode::eOff;
+                else if (m_dev_view_dlss_mode == 2) m_ui.DLSS_Mode = sl::DLSSMode::eMaxQuality;
+                else if (m_dev_view_dlss_mode == 3) m_ui.DLSS_Mode = sl::DLSSMode::eBalanced;
+                else if (m_dev_view_dlss_mode == 4) m_ui.DLSS_Mode = sl::DLSSMode::eMaxPerformance;
+                else if (m_dev_view_dlss_mode == 5) m_ui.DLSS_Mode = sl::DLSSMode::eUltraPerformance;
+                //else if (m_dev_view_dlss_mode == 6) m_ui.DLSS_Mode = sl::DLSSMode::eUltraQuality;
+                else if (m_dev_view_dlss_mode == 6) m_ui.DLSS_Mode = sl::DLSSMode::eDLAA;
+                else if (m_dev_view_dlss_mode == 1) {
+                    if (m_ui.Resolution.x < 1920) m_ui.DLSS_Mode = sl::DLSSMode::eOff;
+                    else if (m_ui.Resolution.x < 2560) m_ui.DLSS_Mode = sl::DLSSMode::eMaxQuality;
+                    else if (m_ui.Resolution.x < 3840) m_ui.DLSS_Mode = sl::DLSSMode::eMaxPerformance;
+                    else m_ui.DLSS_Mode = sl::DLSSMode::eUltraPerformance;
+                }
+
+                if (m_ui.DLSS_Mode != sl::DLSSMode::eOff) {
+                    m_ui.AAMode = AntiAliasingMode::DLSS;
+                }
+                else {
+                    m_ui.AAMode = AntiAliasingMode::NONE;
+                }
             }
 #ifdef STREAMLINE_FEATURE_DLSS_RR
             //
