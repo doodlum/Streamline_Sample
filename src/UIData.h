@@ -32,6 +32,7 @@
 //
 //----------------------------------------------------------------------------------
 #pragma once
+#include <string>
 
 // Donut
 #include <donut/engine/Scene.h>
@@ -49,6 +50,7 @@ enum class AntiAliasingMode {
     NONE,
     TEMPORAL,
     DLSS,
+    NSS,    // Arm Neural Super Sampling (Vulkan only)
 };
 
 /// <summary>
@@ -160,7 +162,14 @@ public:
     };
 #endif // STREAMLINE_FEATURE_DLSS_RR
 
+    // Arm NSS specific parameters (Vulkan only)
+    bool                                NSS_Supported = false;
+    int                                 NSS_Quality = 1;        // 0 = Quality, 1 = Balanced, 2 = Performance (network size)
+    float                               NSS_Scale = 2.f;        // display / render ratio; 2 matches DLSS Performance
+    std::string                         NSS_Status;
+
     // DLSS specific parameters
+    sl::DLSSMode                        DLSS_DefaultMode = sl::DLSSMode::eBalanced;  // mode applied when DLSS gets enabled
     float                               DLSS_Sharpness = 0.f;
     bool                                DLSS_Supported = false;
     sl::DLSSMode                        DLSS_Mode = sl::DLSSMode::eOff;

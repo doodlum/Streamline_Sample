@@ -126,6 +126,14 @@ add_compile_definitions(_GLFW_VULKAN_LIBRARY="sl.interposer.dll")
 endif()
 
 # Add libraries
+# Arm Neural Super Sampling as a second upscaler (see below). The SDK's static libraries carry their own
+# tinyexr implementation, so donut's copy is left out (the sample loads no EXR assets).
+set(NGSDK_ROOT "${CMAKE_SOURCE_DIR}/../neural-graphics-sdk-for-game-engines" CACHE PATH "Neural Graphics SDK root")
+option(ENABLE_NSS "Add Arm NSS as an upscaler (Vulkan)" ON)
+if(ENABLE_NSS)
+    set(DONUT_WITH_TINYEXR OFF CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(donut)
 if(USE_SL)
     add_compile_definitions(USE_SL)
@@ -261,6 +269,26 @@ else()
     else()
         message(FATAL_ERROR "Unsupported platform for NGX Latewarp: ${STREAMLINE_TARGET_ARCH}")
     endif()
+endif()
+
+# Arm Neural Super Sampling as a second upscaler (Vulkan only), from the Neural Graphics SDK "universal" branch,
+# which runs the network on any vendor's ML acceleration. Build the SDK first with its build.py.
+if(ENABLE_NSS AND USE_SL AND EXISTS "${NGSDK_ROOT}/bin/ngsdk_windows_x64.lib")
+    message(STATUS "Arm NSS enabled from ${NGSDK_ROOT}")
+    target_sources(StreamlineSample PRIVATE "src/NSSWrapper.cpp" "src/NSSWrapper.h")
+    target_compile_definitions(StreamlineSample PRIVATE ENABLE_NSS)
+    target_include_directories(StreamlineSample PRIVATE "${NGSDK_ROOT}/ffx-api/include")
+    set(NGSDK_LIB_DIR "${NGSDK_ROOT}/bin/ffx_sdk/windows_x64")
+    target_link_libraries(StreamlineSample
+        "${NGSDK_ROOT}/bin/ngsdk_windows_x64.lib"
+        "${NGSDK_LIB_DIR}/ffx_backend_vk_windows_x64.lib"
+        "${NGSDK_LIB_DIR}/ffx_nss_windows_x64.lib"
+        "${NGSDK_LIB_DIR}/ffx_frameinterpolation_windows_x64.lib"
+        "${NGSDK_LIB_DIR}/ffx_opticalflow_windows_x64.lib"
+        "${NGSDK_LIB_DIR}/SPIRV-Tools-opt.lib"
+        "${NGSDK_LIB_DIR}/SPIRV-Tools.lib")
+elseif(ENABLE_NSS)
+    message(WARNING "Arm NSS disabled: build the Neural Graphics SDK in ${NGSDK_ROOT} first (python build.py -t Release)")
 endif()
 
 set_target_properties(StreamlineSample PROPERTIES FOLDER "Streamline Sample")

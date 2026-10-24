@@ -89,6 +89,24 @@ struct ScriptingConfig {
     int GpuLoad = -1;
     sl::Extent viewportExtent{};
 
+    // Upscaler selection: -AA none|taa|dlss|nss, -NSS_quality 0..2, -NSS_scale 2.0, -jitter 0..3 (MSAA, Halton, R2, white noise)
+    int aaMode = -1;
+    int NSS_quality = -1;
+    float NSS_scale = 0.f;
+    int jitter = -1;
+
+    // Deterministic capture for quality comparisons (CGVQM):
+    //   -captureDir <dir>     write the tone-mapped frame (before UI) as <dir>/frame_NNNN.png
+    //   -captureFrames N      number of frames written (default 120)
+    //   -captureWarmup N      frames rendered on the camera path before the first capture (default 30)
+    //   -reference K          ground truth: average K jittered, non-antialiased display-resolution frames per frame
+    //   -exposure L           fixed adapted luminance (default 0.12) so every run tone maps identically
+    std::string captureDir;
+    int captureFrames = 120;
+    int captureWarmup = 30;
+    int referenceSamples = 0;
+    float captureExposure = 0.12f;
+
     ScriptingConfig(int argc, const char* const* argv)
     {
 
@@ -149,6 +167,43 @@ struct ScriptingConfig {
                 int ret = sscanf(argv[++i], "(%d,%d,%dx%d)", &viewportExtent.left, &viewportExtent.top, &viewportExtent.width, &viewportExtent.height);
                 assert(ret == 4);
             }
+            else if (!strcmp(argv[i], "-AA"))
+            {
+                const std::string mode = argv[++i];
+                aaMode = mode == "none" ? 0 : mode == "taa" ? 1 : mode == "dlss" ? 2 : mode == "nss" ? 3 : -1;
+            }
+            else if (!strcmp(argv[i], "-NSS_quality"))
+            {
+                NSS_quality = std::stoi(argv[++i]);
+            }
+            else if (!strcmp(argv[i], "-NSS_scale"))
+            {
+                NSS_scale = std::stof(argv[++i]);
+            }
+            else if (!strcmp(argv[i], "-jitter"))
+            {
+                jitter = std::stoi(argv[++i]);
+            }
+            else if (!strcmp(argv[i], "-captureDir"))
+            {
+                captureDir = argv[++i];
+            }
+            else if (!strcmp(argv[i], "-captureFrames"))
+            {
+                captureFrames = std::stoi(argv[++i]);
+            }
+            else if (!strcmp(argv[i], "-captureWarmup"))
+            {
+                captureWarmup = std::stoi(argv[++i]);
+            }
+            else if (!strcmp(argv[i], "-reference"))
+            {
+                referenceSamples = std::stoi(argv[++i]);
+            }
+            else if (!strcmp(argv[i], "-exposure"))
+            {
+                captureExposure = std::stof(argv[++i]);
+            }
             else if (!strcmp(argv[i], "-GpuLoad"))
             {
                 int ret = sscanf(argv[++i], "%d", &GpuLoad);
@@ -192,6 +247,24 @@ private:
 
     // RenderTargets
     std::unique_ptr<RenderTargets>                  m_RenderTargets;
+
+    // Arm NSS and deterministic capture
+    nvrhi::ShaderHandle                             m_NSSDepthCopyShader;
+    nvrhi::ShaderHandle                             m_AccumulateFirstShader;
+    nvrhi::ShaderHandle                             m_AccumulateShader;
+    nvrhi::ShaderHandle                             m_ResolveShader;
+    nvrhi::BindingLayoutHandle                      m_AccumulateLayout;
+    nvrhi::ComputePipelineHandle                    m_AccumulateFirstPipeline;
+    nvrhi::ComputePipelineHandle                    m_AccumulatePipeline;
+    nvrhi::ComputePipelineHandle                    m_ResolvePipeline;
+    nvrhi::TextureHandle                            m_ReferenceAccum;
+    int                                             m_CaptureAppFrame = 0;   // frames rendered since the scene loaded
+    bool IsCapturing() const { return !m_ScriptingConfig.captureDir.empty(); }
+    int  CaptureSamples() const { return m_ScriptingConfig.referenceSamples > 0 ? m_ScriptingConfig.referenceSamples : 1; }
+    int  CapturePathFrame() const { return m_CaptureAppFrame / CaptureSamples(); }
+    int  CaptureSubframe() const { return m_CaptureAppFrame % CaptureSamples(); }
+    void UpdateCaptureCamera();
+    void RunAccumulate(nvrhi::ComputePipelineHandle pipeline, nvrhi::ITexture* input, nvrhi::ITexture* output);
     // Invoked immediately before replacing m_RenderTargets so external cache owners
     // can release handles to textures placed in m_RenderTargets->Heap.
     std::function<void()>                           m_BeforeRenderTargetsRecreated;

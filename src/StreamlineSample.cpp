@@ -57,9 +57,28 @@ using namespace donut::engine;
 using namespace donut::render;
 using namespace donut::render;
 
+#ifdef ENABLE_NSS
+#include "NSSWrapper.h"
+#endif
+#include <donut/engine/TextureCache.h>
+#include <filesystem>
+
 namespace
 {
     constexpr float kSampleCameraNearPlane = 0.01f;
+    constexpr float kSampleCameraFarPlane  = 200.f;
+    constexpr float kCaptureFrameTime      = 1.f / 60.f;
+
+    float Halton(int index, int base)
+    {
+        float f = 1.f, r = 0.f;
+        for (int i = index; i > 0; i /= base)
+        {
+            f /= float(base);
+            r += f * float(i % base);
+        }
+        return r;
+    }
 }
 
 // Constructor
@@ -135,6 +154,38 @@ StreamlineSample::StreamlineSample(
 
     m_CommandList = GetDevice()->createCommandList();
 
+    // Compute shaders for capture accumulation (and the NSS depth copy).
+    {
+        m_AccumulateFirstShader = m_ShaderFactory->CreateShader("app/CaptureAccumulate.hlsl", "AccumulateFirst", nullptr, nvrhi::ShaderType::Compute);
+        m_AccumulateShader      = m_ShaderFactory->CreateShader("app/CaptureAccumulate.hlsl", "Accumulate", nullptr, nvrhi::ShaderType::Compute);
+        m_ResolveShader         = m_ShaderFactory->CreateShader("app/CaptureAccumulate.hlsl", "Resolve", nullptr, nvrhi::ShaderType::Compute);
+
+        nvrhi::BindingLayoutDesc layoutDesc;
+        layoutDesc.visibility = nvrhi::ShaderType::Compute;
+        layoutDesc.bindings   = { nvrhi::BindingLayoutItem::Texture_SRV(0), nvrhi::BindingLayoutItem::Texture_UAV(0) };
+        m_AccumulateLayout    = GetDevice()->createBindingLayout(layoutDesc);
+
+        auto makePipeline = [&](nvrhi::ShaderHandle shader) {
+            nvrhi::ComputePipelineDesc desc;
+            desc.CS             = shader;
+            desc.bindingLayouts = { m_AccumulateLayout };
+            return GetDevice()->createComputePipeline(desc);
+        };
+        m_AccumulateFirstPipeline = makePipeline(m_AccumulateFirstShader);
+        m_AccumulatePipeline      = makePipeline(m_AccumulateShader);
+        m_ResolvePipeline         = makePipeline(m_ResolveShader);
+    }
+
+#ifdef ENABLE_NSS
+    m_ui.NSS_Supported = NSSWrapper::Get().IsAvailable(GetDevice());
+    if (m_ui.NSS_Supported)
+    {
+        m_NSSDepthCopyShader = m_ShaderFactory->CreateShader("app/NSSDepthCopy.hlsl", "main", nullptr, nvrhi::ShaderType::Compute);
+        NSSWrapper::Get().SetDepthCopyShader(m_NSSDepthCopyShader);
+    }
+    m_ui.NSS_Status = m_ui.NSS_Supported ? "NSS: ready" : "NSS: needs the Vulkan renderer (-vk)";
+#endif
+
     m_FirstPersonCamera.SetMoveSpeed(3.0f);
 
     SetAsynchronousLoadingEnabled(false);
@@ -189,6 +240,35 @@ StreamlineSample::StreamlineSample(
     }
     m_ui.DLSSPresetsReset();
 
+    if (m_ScriptingConfig.DLSS_mode != -1 && m_ui.AAMode == AntiAliasingMode::DLSS)
+        m_ui.DLSS_DefaultMode = m_ui.DLSS_Mode;
+    if (m_ScriptingConfig.NSS_quality != -1)
+        m_ui.NSS_Quality = m_ScriptingConfig.NSS_quality;
+    if (m_ScriptingConfig.NSS_scale > 0.f)
+        m_ui.NSS_Scale = m_ScriptingConfig.NSS_scale;
+    if (m_ScriptingConfig.jitter != -1)
+        m_ui.TemporalAntiAliasingJitter = static_cast<donut::render::TemporalAntiAliasingJitter>(m_ScriptingConfig.jitter);
+    switch (m_ScriptingConfig.aaMode)
+    {
+    case 0: m_ui.AAMode = AntiAliasingMode::NONE; break;
+    case 1: m_ui.AAMode = AntiAliasingMode::TEMPORAL; break;
+    case 2: m_ui.AAMode = AntiAliasingMode::DLSS; break;
+    case 3: m_ui.AAMode = m_ui.NSS_Supported ? AntiAliasingMode::NSS : AntiAliasingMode::TEMPORAL; break;
+    default: break;
+    }
+
+    if (IsCapturing())
+    {
+        // Identical, frame-locked conditions for every upscaler: Halton jitter, fixed exposure, no UI-driven changes.
+        if (m_ScriptingConfig.jitter == -1)
+            m_ui.TemporalAntiAliasingJitter = donut::render::TemporalAntiAliasingJitter::Halton;
+        m_ui.ToneMappingParams.minAdaptedLuminance = m_ScriptingConfig.captureExposure;
+        m_ui.ToneMappingParams.maxAdaptedLuminance = m_ScriptingConfig.captureExposure;
+        if (m_ScriptingConfig.referenceSamples > 0)
+            m_ui.AAMode = AntiAliasingMode::NONE;
+        std::filesystem::create_directories(m_ScriptingConfig.captureDir);
+    }
+
 #ifdef STREAMLINE_FEATURE_DLSS_RR
     if (m_ScriptingConfig.DLSSRR_mode != -1 && NVWrapper::Get().GetDLSSRRLastEnable()) {
         static constexpr std::array<int, 6> ValidDLLSRRIndices{ 0,1,2,3,4,6 };
@@ -233,6 +313,11 @@ StreamlineSample::~StreamlineSample()
     NVWrapper::Get().CleanupDLSSRR(true);
 #endif // STREAMLINE_FEATURE_DLSS_RR
     NVWrapper::Get().CleanupDLSSG(false);
+
+#ifdef ENABLE_NSS
+    GetDevice()->waitForIdle();
+    NSSWrapper::Get().Release();
+#endif
 
     #if STREAMLINE_FEATURE_LATEWARP
     NVWrapper::Get().CleanupLatewarp(true);
@@ -508,6 +593,13 @@ bool StreamlineSample::SetupView()
     if (m_TemporalAntiAliasingPass) m_TemporalAntiAliasingPass->SetJitter(m_ui.TemporalAntiAliasingJitter);
 
     float2 pixelOffset = m_ui.AAMode != AntiAliasingMode::NONE && m_TemporalAntiAliasingPass ? m_TemporalAntiAliasingPass->GetCurrentPixelOffset() : float2(0.f);
+
+    // Ground truth: each subframe samples a different sub-pixel position (Halton 2,3) of the same instant.
+    if (IsCapturing() && m_ScriptingConfig.referenceSamples > 0)
+    {
+        const int index = CaptureSubframe() + 1;
+        pixelOffset     = float2(Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f);
+    }
 
     std::shared_ptr<PlanarView> planarView = std::dynamic_pointer_cast<PlanarView, IView>(m_View);
 
@@ -928,8 +1020,8 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
     }
     // If we turn on DLSS then we set its default values
     else if (m_ui.DLSS_Last_AA != AntiAliasingMode::DLSS && m_ui.AAMode == AntiAliasingMode::DLSS) {
-        DLSS_Last_Mode = sl::DLSSMode::eBalanced;
-        m_ui.DLSS_Mode = sl::DLSSMode::eBalanced;
+        DLSS_Last_Mode = m_ui.DLSS_DefaultMode;
+        m_ui.DLSS_Mode = m_ui.DLSS_DefaultMode;
         m_DLSS_Last_DisplaySize = { 0,0 };
     }
     m_ui.DLSS_Last_AA = m_ui.AAMode;
@@ -1030,6 +1122,19 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
         // Use the formula of the DLSS programming guide for the Texture LOD Bias...
         lodBias = std::log2f(texLodXDimension/m_DisplaySize.x) - 1;
     }
+#ifdef ENABLE_NSS
+    else if (m_ui.AAMode == AntiAliasingMode::NSS)
+    {
+        sl::DLSSOptions dlssConstants = {};
+        dlssConstants.mode = sl::DLSSMode::eOff;
+        NVWrapper::Get().SetDLSSOptions(dlssConstants);
+
+        // Same rounding as DLSS' fixed ratios, so DLSS Performance and NSS 2x render the same pixels.
+        const float scale = dm::clamp(m_ui.NSS_Scale, 1.f, 3.f);
+        m_RenderingRectSize = int2(int(float(m_DisplaySize.x) / scale + 0.5f), int(float(m_DisplaySize.y) / scale + 0.5f));
+        lodBias = std::log2f(float(m_RenderingRectSize.x) / m_DisplaySize.x) - 1;
+    }
+#endif
     else {
         sl::DLSSOptions dlssConstants = {};
         dlssConstants.mode = sl::DLSSMode::eOff;
@@ -1374,6 +1479,39 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
             m_PreviousViewsValid = false;
         }
 
+#ifdef ENABLE_NSS
+        // DO NSS
+        if (m_ui.AAMode == AntiAliasingMode::NSS)
+        {
+            NSSWrapper::Settings settings;
+            settings.renderSize    = m_RenderingRectSize;
+            settings.displaySize   = m_DisplaySize;
+            settings.quality       = m_ui.NSS_Quality;
+            settings.depthInverted = m_View->IsReverseDepth();
+
+            if (NSSWrapper::Get().Configure(GetDevice(), settings))
+            {
+                NSSWrapper::Inputs inputs;
+                inputs.color         = m_RenderTargets->HdrColor;
+                inputs.depth         = m_RenderTargets->Depth;
+                inputs.motionVectors = m_RenderTargets->MotionVectors;
+                inputs.output        = m_RenderTargets->AAResolvedColor;
+                inputs.jitterOffset  = std::dynamic_pointer_cast<PlanarView, IView>(m_View)->GetPixelOffset();
+                inputs.cameraNear    = kSampleCameraNearPlane;
+                inputs.cameraFar     = kSampleCameraFarPlane;
+                inputs.cameraFovY    = dm::radians(m_CameraVerticalFov);
+                inputs.frameTimeMs   = IsCapturing() ? kCaptureFrameTime * 1000.f : float(GetDeviceManager()->GetAverageFrameTimeSeconds() * 1000.0);
+                inputs.reset         = needNewPasses || !m_PreviousViewsValid;
+                NSSWrapper::Get().Evaluate(GetDevice(), m_CommandList, inputs);
+            }
+            else
+            {
+                m_CommonPasses->BlitTexture(m_CommandList, m_RenderTargets->AAResolvedFramebuffer->GetFramebuffer(*m_View), m_RenderTargets->HdrColor, &m_BindingCache);
+            }
+            m_ui.NSS_Status = NSSWrapper::Get().GetStatus();
+        }
+#endif
+
         // DO TAA
         if (m_ui.AAMode == AntiAliasingMode::TEMPORAL)
         {
@@ -1381,6 +1519,25 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
         }
 
         m_PreviousViewsValid = true;
+    }
+    else if (IsCapturing() && m_ScriptingConfig.referenceSamples > 0)
+    {
+        // GROUND TRUTH -> average the jittered subframes of this instant in linear HDR, then tone map as usual
+        if (!m_ReferenceAccum || m_ReferenceAccum->getDesc().width != uint32_t(m_DisplaySize.x) || m_ReferenceAccum->getDesc().height != uint32_t(m_DisplaySize.y))
+        {
+            nvrhi::TextureDesc desc;
+            desc.width            = m_DisplaySize.x;
+            desc.height           = m_DisplaySize.y;
+            desc.format           = nvrhi::Format::RGBA32_FLOAT;
+            desc.isUAV            = true;
+            desc.initialState     = nvrhi::ResourceStates::UnorderedAccess;
+            desc.keepInitialState = true;
+            desc.debugName        = "ReferenceAccum";
+            m_ReferenceAccum      = GetDevice()->createTexture(desc);
+        }
+        RunAccumulate(CaptureSubframe() == 0 ? m_AccumulateFirstPipeline : m_AccumulatePipeline, m_RenderTargets->HdrColor, m_ReferenceAccum);
+        RunAccumulate(m_ResolvePipeline, m_ReferenceAccum, m_RenderTargets->AAResolvedColor);
+        m_PreviousViewsValid = false;
     }
     else
     {
@@ -1579,7 +1736,25 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
         GetDeviceManager()->SetVsyncEnabled(m_ui.EnableVsync);
     }
 
-    // CLOSE: 
+    // CAPTURE: write the tone-mapped frame once all of its subframes have been accumulated.
+    if (IsCapturing())
+    {
+        const int pathFrame = CapturePathFrame();
+        const int captured  = pathFrame - m_ScriptingConfig.captureWarmup;
+        if (CaptureSubframe() == CaptureSamples() - 1 && captured >= 0 && captured < m_ScriptingConfig.captureFrames)
+        {
+            char name[64];
+            snprintf(name, sizeof(name), "frame_%04d.png", captured);
+            const std::string path = (std::filesystem::path(m_ScriptingConfig.captureDir) / name).string();
+            if (!SaveTextureToFile(GetDevice(), m_CommonPasses.get(), m_RenderTargets->ColorspaceCorrectionColor, nvrhi::ResourceStates::RenderTarget, path.c_str(), false))
+                log::error("Failed to write %s", path.c_str());
+        }
+        ++m_CaptureAppFrame;
+        if (CapturePathFrame() >= m_ScriptingConfig.captureWarmup + m_ScriptingConfig.captureFrames)
+            glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), GLFW_TRUE);
+    }
+
+    // CLOSE:
     if (GetFrameIndex() == m_ScriptingConfig.maxFrames)
         glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), GLFW_TRUE);
 }
@@ -1627,6 +1802,19 @@ bool StreamlineSample::KeyboardUpdate(int key, int scancode, int action, int mod
     
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
         m_ui.EnableAnimations = !m_ui.EnableAnimations;
+    }
+
+    // N: flip between DLSS and NSS at the same render resolution (DLSS Performance <-> NSS 2x).
+    if (key == GLFW_KEY_N && action == GLFW_PRESS && m_ui.NSS_Supported) {
+        if (m_ui.AAMode == AntiAliasingMode::NSS && m_ui.DLSS_Supported) {
+            m_ui.DLSS_DefaultMode = sl::DLSSMode::eMaxPerformance;
+            m_ui.AAMode = AntiAliasingMode::DLSS;
+        }
+        else {
+            m_ui.NSS_Scale = 2.f;
+            m_ui.AAMode = AntiAliasingMode::NSS;
+        }
+        return true;
     }
 
     m_FirstPersonCamera.KeyboardUpdate(key, scancode, action, mods);
@@ -1688,9 +1876,31 @@ void StreamlineSample::ToggleFullscreen()
     // through its window resize callback system
 }
 
+void StreamlineSample::UpdateCaptureCamera()
+{
+    // A fixed walk down the atrium with a gentle sway and pan, parameterised by the capture frame only.
+    const int   total = m_ScriptingConfig.captureWarmup + m_ScriptingConfig.captureFrames;
+    const float t     = float(CapturePathFrame()) / float(dm::max(total - 1, 1));
+    const float x     = -4.0f + 6.0f * t;
+    const float3 position(x, 1.8f + 0.15f * std::sin(t * 6.2831853f), 0.6f * std::sin(t * 3.1415926f));
+    const float  yaw = 0.35f * std::sin(t * 6.2831853f * 1.5f);
+    const float3 direction(std::cos(yaw), -0.05f, std::sin(yaw));
+    m_FirstPersonCamera.LookAt(position, position + direction);
+}
+
 void StreamlineSample::Animate(float fElapsedTimeSeconds)
 {
-    m_FirstPersonCamera.Animate(fElapsedTimeSeconds);
+    if (IsCapturing())
+    {
+        // Frame-locked: identical scene, camera and animation state for every run.
+        fElapsedTimeSeconds = CaptureSubframe() == 0 ? kCaptureFrameTime : 0.f;
+        if (IsSceneLoaded())
+            UpdateCaptureCamera();
+    }
+    else
+    {
+        m_FirstPersonCamera.Animate(fElapsedTimeSeconds);
+    }
 
     if (m_ToneMappingPass)
         m_ToneMappingPass->AdvanceFrame(fElapsedTimeSeconds);
@@ -1698,6 +1908,8 @@ void StreamlineSample::Animate(float fElapsedTimeSeconds)
     if (IsSceneLoaded() && m_ui.EnableAnimations)
     {
         m_WallclockTime += fElapsedTimeSeconds*m_ui.AnimationSpeed;
+        if (IsCapturing())
+            m_WallclockTime = float(CapturePathFrame()) * kCaptureFrameTime * m_ui.AnimationSpeed;
 
         for (const auto& anim : m_Scene->GetSceneGraph()->GetAnimations())
         {
@@ -1707,6 +1919,19 @@ void StreamlineSample::Animate(float fElapsedTimeSeconds)
             (void)anim->Apply(animationTime);
         }
     }
+}
+
+void StreamlineSample::RunAccumulate(nvrhi::ComputePipelineHandle pipeline, nvrhi::ITexture* input, nvrhi::ITexture* output)
+{
+    nvrhi::BindingSetDesc setDesc;
+    setDesc.bindings = { nvrhi::BindingSetItem::Texture_SRV(0, input), nvrhi::BindingSetItem::Texture_UAV(0, output) };
+    nvrhi::BindingSetHandle set = m_BindingCache.GetOrCreateBindingSet(setDesc, m_AccumulateLayout);
+    nvrhi::ComputeState state;
+    state.pipeline = pipeline;
+    state.bindings = { set };
+    m_CommandList->setComputeState(state);
+    const auto& desc = output->getDesc();
+    m_CommandList->dispatch((desc.width + 7) / 8, (desc.height + 7) / 8);
 }
 
 void StreamlineSample::SceneUnloading()

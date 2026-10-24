@@ -678,7 +678,7 @@ protected:
 #ifdef STREAMLINE_FEATURE_DLSS_RR
                 if (m_ui.DLSSRR_Mode != sl::DLSSMode::eOff) pushDisabled();
 #endif
-                ImGui::Combo("AA Mode", (int*)&m_ui.AAMode, "None\0TemporalAA\0DLSS\0");
+                ImGui::Combo("AA Mode", (int*)&m_ui.AAMode, m_ui.NSS_Supported ? "None\0TemporalAA\0DLSS\0NSS (Arm)\0" : "None\0TemporalAA\0DLSS\0");
 #ifdef STREAMLINE_FEATURE_DLSS_RR
                 if (m_ui.DLSSRR_Mode != sl::DLSSMode::eOff) popDisabled();
 #endif
@@ -687,14 +687,24 @@ protected:
 #ifdef STREAMLINE_FEATURE_DLSS_RR
                 if (m_ui.DLSSRR_Mode != sl::DLSSMode::eOff) pushDisabled();
 #endif
-                ImGui::Combo("TAA Fallback", (int*)&m_ui.AAMode, "None\0TemporalAA");
+                ImGui::Combo("TAA Fallback", (int*)&m_ui.AAMode, m_ui.NSS_Supported ? "None\0TemporalAA\0(DLSS unavailable)\0NSS (Arm)\0" : "None\0TemporalAA");
 #ifdef STREAMLINE_FEATURE_DLSS_RR
                 if (m_ui.DLSSRR_Mode != sl::DLSSMode::eOff) popDisabled();
 #endif
             }
 
-            if (m_ui.AAMode == AntiAliasingMode::TEMPORAL) {
-                ImGui::Combo("TAA Camera Jitter", (int*)&m_ui.TemporalAntiAliasingJitter, "MSAA\0Halton\0R2\0White Noise\0");
+            if (m_ui.AAMode == AntiAliasingMode::TEMPORAL || m_ui.AAMode == AntiAliasingMode::DLSS || m_ui.AAMode == AntiAliasingMode::NSS) {
+                ImGui::Combo("Camera Jitter", (int*)&m_ui.TemporalAntiAliasingJitter, "MSAA\0Halton\0R2\0White Noise\0");
+            }
+
+            if (m_ui.NSS_Supported)
+                ImGui::TextDisabled("Press N to toggle DLSS / NSS at the same render resolution");
+
+            if (m_ui.AAMode == AntiAliasingMode::NSS)
+            {
+                ImGui::Combo("NSS Quality", &m_ui.NSS_Quality, "Quality\0Balanced\0Performance\0");
+                ImGui::SliderFloat("NSS Scale", &m_ui.NSS_Scale, 1.0f, 3.0f, "%.2fx");
+                ImGui::TextWrapped("%s", m_ui.NSS_Status.c_str());
             }
 
 

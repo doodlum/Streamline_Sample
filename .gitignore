@@ -1,0 +1,7 @@
+_build/
+_bin/
+streamline/bin/
+streamline/include/
+streamline/lib/
+streamline/scripts/
+streamline/CMakeLists.txt

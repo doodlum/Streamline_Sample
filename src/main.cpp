@@ -37,6 +37,10 @@
 #include <chrono>
 
 #include <donut/core/vfs/VFS.h>
+#ifdef ENABLE_NSS
+#include "NSSWrapper.h"
+#include "DeviceManagerOverride/DeviceManagerOverride.h"
+#endif
 #include <donut/core/log.h>
 #include <donut/core/string_utils.h>
 #include <donut/engine/CommonRenderPasses.h>
@@ -304,6 +308,20 @@ int main(int __argc, const char* const* __argv)
         deviceParams.requiredVulkanDeviceExtensions.push_back("VK_KHR_ray_query");
         deviceParams.requiredVulkanDeviceExtensions.push_back("VK_KHR_acceleration_structure");
         deviceParams.requiredVulkanDeviceExtensions.push_back("VK_KHR_pipeline_library");
+#ifdef ENABLE_NSS
+        // Arm NSS: enable the ML compute features (int8 / fp16 / cooperative matrices / dot products) the GPU supports.
+        auto* vkManager = static_cast<DeviceManagerOverride_VK*>(deviceManager);
+        deviceParams.deviceCreateInfoCallback = [vkManager](VkDeviceCreateInfo& info)
+        {
+            HMODULE loader = GetModuleHandleA("sl.interposer.dll");
+            if (!loader)
+                loader = GetModuleHandleA("vulkan-1.dll");
+            void* gipa = loader ? reinterpret_cast<void*>(GetProcAddress(loader, "vkGetInstanceProcAddr")) : nullptr;
+            if (gipa)
+                NSSWrapper::Get().PrepareVulkanDeviceCreate(static_cast<VkInstance>(vkManager->GetInstance()),
+                                                            static_cast<VkPhysicalDevice>(vkManager->GetPhysicalDevice()), gipa, info);
+        };
+#endif
     }
 #endif
 
