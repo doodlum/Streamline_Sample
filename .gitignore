@@ -5,3 +5,4 @@ streamline/include/
 streamline/lib/
 streamline/scripts/
 streamline/CMakeLists.txt
+_bin_helix/

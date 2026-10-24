@@ -62,6 +62,7 @@ using namespace donut::render;
 #endif
 #include <donut/engine/TextureCache.h>
 #include <filesystem>
+#include <algorithm>
 
 namespace
 {
@@ -250,6 +251,11 @@ StreamlineSample::StreamlineSample(
         m_ui.NSS_Scale = m_ScriptingConfig.NSS_scale;
     if (m_ScriptingConfig.jitter != -1)
         m_ui.TemporalAntiAliasingJitter = static_cast<donut::render::TemporalAntiAliasingJitter>(m_ScriptingConfig.jitter);
+    if (m_ScriptingConfig.DLSS_preset != -1)
+    {
+        for (int i = 0; i < static_cast<int>(sl::DLSSMode::eCount); ++i)
+            m_ui.DLSS_presets[i] = static_cast<sl::DLSSPreset>(m_ScriptingConfig.DLSS_preset);
+    }
     switch (m_ScriptingConfig.aaMode)
     {
     case 0: m_ui.AAMode = AntiAliasingMode::NONE; break;
@@ -1472,6 +1478,23 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
     
     // ANTI-ALIASING
 
+    // Benchmark: GPU time of everything the upscaler records (DLSS through Streamline, an injected replacement, NSS).
+    const int timerSlot = m_CaptureAppFrame % kTimerRing;
+    const bool timeUpscaler = IsCapturing() && m_ScriptingConfig.benchmark;
+    if (timeUpscaler)
+    {
+        if (!m_UpscaleTimers[timerSlot])
+            m_UpscaleTimers[timerSlot] = GetDevice()->createTimerQuery();
+        if (m_UpscaleTimerUsed[timerSlot])
+        {
+            const float ms = GetDevice()->getTimerQueryTime(m_UpscaleTimers[timerSlot]) * 1000.f;
+            if (CapturePathFrame() - kTimerRing >= m_ScriptingConfig.captureWarmup)
+                m_BenchUpscaleMs.push_back(ms);
+            GetDevice()->resetTimerQuery(m_UpscaleTimers[timerSlot]);
+        }
+        m_CommandList->beginTimerQuery(m_UpscaleTimers[timerSlot]);
+    }
+
     // TAG STREAMLINE RESOURCES
     NVWrapper::Get().TagResources_DLSS_NIS(m_CommandList,
         m_View->GetChildView(ViewType::PLANAR, 0),
@@ -1576,6 +1599,12 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
         NVWrapper::Get().EvaluateDLSSRR(m_CommandList);
     }
 #endif // STREAMLINE_FEATURE_DLSS_RR
+
+    if (timeUpscaler)
+    {
+        m_CommandList->endTimerQuery(m_UpscaleTimers[timerSlot]);
+        m_UpscaleTimerUsed[timerSlot] = true;
+    }
 
     //DO TONEMAPPING
     nvrhi::ITexture* texToDisplay;
@@ -1756,7 +1785,11 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
     {
         const int pathFrame = CapturePathFrame();
         const int captured  = pathFrame - m_ScriptingConfig.captureWarmup;
-        if (CaptureSubframe() == CaptureSamples() - 1 && captured >= 0 && captured < m_ScriptingConfig.captureFrames)
+        const auto now = std::chrono::high_resolution_clock::now();
+        if (m_ScriptingConfig.benchmark && captured >= 0 && captured < m_ScriptingConfig.captureFrames)
+            m_BenchFrameMs.push_back(std::chrono::duration<float, std::milli>(now - m_BenchLastFrame).count());
+        m_BenchLastFrame = now;
+        if (!m_ScriptingConfig.benchmark && CaptureSubframe() == CaptureSamples() - 1 && captured >= 0 && captured < m_ScriptingConfig.captureFrames)
         {
             char name[64];
             snprintf(name, sizeof(name), "frame_%04d.png", captured);
@@ -1807,7 +1840,11 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
         }
         ++m_CaptureAppFrame;
         if (CapturePathFrame() >= m_ScriptingConfig.captureWarmup + m_ScriptingConfig.captureFrames)
+        {
+            if (m_ScriptingConfig.benchmark)
+                WriteBenchmark();
             glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), GLFW_TRUE);
+        }
     }
 
     // CLOSE:
@@ -1974,6 +2011,46 @@ void StreamlineSample::Animate(float fElapsedTimeSeconds)
             float animationTime = std::modf(m_WallclockTime / duration, &integral) * duration;
             (void)anim->Apply(animationTime);
         }
+    }
+}
+
+void StreamlineSample::WriteBenchmark()
+{
+    // Collect the timers still in flight.
+    GetDevice()->waitForIdle();
+    for (int i = 0; i < kTimerRing; ++i)
+    {
+        if (m_UpscaleTimerUsed[i] && GetDevice()->pollTimerQuery(m_UpscaleTimers[i]))
+            m_BenchUpscaleMs.push_back(GetDevice()->getTimerQueryTime(m_UpscaleTimers[i]) * 1000.f);
+    }
+
+    auto stats = [](std::vector<float> v) {
+        if (v.empty())
+            return std::string("n/a");
+        std::sort(v.begin(), v.end());
+        double sum = 0;
+        for (float x : v)
+            sum += x;
+        char text[128];
+        snprintf(text, sizeof(text), "mean %.3f ms, median %.3f ms, p95 %.3f ms (n=%zu)", sum / v.size(), v[v.size() / 2],
+                 v[std::min(v.size() - 1, size_t(v.size() * 0.95))], v.size());
+        return std::string(text);
+    };
+
+    static const char* kModes[] = {"none", "taa", "dlss", "nss"};
+    const std::string path = (std::filesystem::path(m_ScriptingConfig.captureDir) / "benchmark.txt").string();
+    if (FILE* f = fopen(path.c_str(), "w"))
+    {
+        fprintf(f, "api %s\n", nvrhi::utils::GraphicsAPIToString(GetDevice()->getGraphicsAPI()));
+        fprintf(f, "aa %s\n", kModes[int(m_ui.AAMode)]);
+        fprintf(f, "render %dx%d display %dx%d\n", m_RenderingRectSize.x, m_RenderingRectSize.y, m_DisplaySize.x, m_DisplaySize.y);
+#ifdef ENABLE_NSS
+        if (m_ui.AAMode == AntiAliasingMode::NSS)
+            fprintf(f, "nss %s\n", NSSWrapper::Get().GetStatus().c_str());
+#endif
+        fprintf(f, "frame %s\n", stats(m_BenchFrameMs).c_str());
+        fprintf(f, "upscaler_gpu %s\n", stats(m_BenchUpscaleMs).c_str());
+        fclose(f);
     }
 }
 

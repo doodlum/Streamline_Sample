@@ -107,6 +107,11 @@ struct ScriptingConfig {
     int referenceSamples = 0;
     float captureExposure = 0.12f;
     bool captureStatic = false;     // -captureStatic: camera and animations frozen at the start of the path
+    // -benchmark: run the capture path without writing frames; <captureDir>/benchmark.txt gets the frame time and
+    //             the GPU time of the upscaler call (timer queries around it) over the -captureFrames frames
+    bool benchmark = false;
+    // -DLSS_preset <A..O>: force one DLSS render preset for every quality mode (e.g. E, the CNN model HelixSR runs)
+    int DLSS_preset = -1;
     bool freezeAnimation = false;   // -freezeAnimation: scene animations frozen, camera still moves
 
     ScriptingConfig(int argc, const char* const* argv)
@@ -206,6 +211,15 @@ struct ScriptingConfig {
             {
                 freezeAnimation = true;
             }
+            else if (!strcmp(argv[i], "-benchmark"))
+            {
+                benchmark = true;
+            }
+            else if (!strcmp(argv[i], "-DLSS_preset"))
+            {
+                const char letter = argv[++i][0];
+                DLSS_preset = (letter >= 'A' && letter <= 'O') ? (letter - 'A' + 1) : (letter >= 'a' && letter <= 'o') ? (letter - 'a' + 1) : -1;
+            }
             else if (!strcmp(argv[i], "-captureStatic"))
             {
                 captureStatic = true;
@@ -270,6 +284,15 @@ private:
     nvrhi::TextureHandle                            m_ReferenceAccum;
     int                                             m_CaptureAppFrame = 0;   // frames rendered since the scene loaded
     uint32_t                                        m_UpscalerJitterFrame = 0;  // index into the shared DLSS/NSS jitter sequence
+
+    // -benchmark: GPU time of the upscaler call (ring of timer queries) and frame-to-frame time
+    static constexpr int                            kTimerRing = 4;
+    nvrhi::TimerQueryHandle                         m_UpscaleTimers[kTimerRing];
+    bool                                            m_UpscaleTimerUsed[kTimerRing] = {};
+    std::vector<float>                              m_BenchUpscaleMs;
+    std::vector<float>                              m_BenchFrameMs;
+    std::chrono::high_resolution_clock::time_point  m_BenchLastFrame;
+    void WriteBenchmark();
     bool IsCapturing() const { return !m_ScriptingConfig.captureDir.empty(); }
     int  CaptureSamples() const { return m_ScriptingConfig.referenceSamples > 0 ? m_ScriptingConfig.referenceSamples : 1; }
     int  CapturePathFrame() const { return m_CaptureAppFrame / CaptureSamples(); }
