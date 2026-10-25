@@ -266,6 +266,7 @@ bool NSSWrapper::Configure(nvrhi::IDevice* device, const Settings& settings)
 
     static const char* kQualityNames[] = {"Quality", "Balanced", "Performance"};
     m_Context     = context;
+    m_EvalIndex   = 0;
     m_Settings    = settings;
     m_HasSettings = true;
     m_Status      = std::string("NSS ") + kQualityNames[settings.quality % 3] + " " + std::to_string(settings.renderSize.x) + "x" +
@@ -316,7 +317,14 @@ void NSSWrapper::Evaluate(nvrhi::IDevice* device, nvrhi::ICommandList* commandLi
     const donut::math::int2   renderSize = m_Settings.renderSize;
     EnsureDepthCopy(device, renderSize);
 
-    // Depth -> R32F
+    // Input replay for bit-exact shader comparisons (NSS_REPLAY_DIR, see ReplayInputs): replaces this frame's inputs with
+    // ones recorded by an earlier capture run, so two builds can be fed identical frames.
+    Inputs        replayed  = in;
+    const bool    replaying = ReplayInputs(device, commandList, in, replayed);
+    const Inputs& frameIn   = replaying ? replayed : in;
+
+    // Depth -> R32F (a replayed frame uploads the recorded R32F depth instead)
+    if (!replaying)
     {
         nvrhi::BindingSetDesc setDesc;
         setDesc.bindings = {nvrhi::BindingSetItem::Texture_SRV(0, in.depth), nvrhi::BindingSetItem::Texture_UAV(0, m_DepthR32)};
@@ -328,17 +336,17 @@ void NSSWrapper::Evaluate(nvrhi::IDevice* device, nvrhi::ICommandList* commandLi
         commandList->dispatch((renderSize.x + 7) / 8, (renderSize.y + 7) / 8);
     }
 
-    commandList->setTextureState(in.color, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+    commandList->setTextureState(frameIn.color, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
     commandList->setTextureState(m_DepthR32, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
-    commandList->setTextureState(in.motionVectors, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+    commandList->setTextureState(frameIn.motionVectors, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
     commandList->setTextureState(in.output, nvrhi::AllSubresources, nvrhi::ResourceStates::UnorderedAccess);
     commandList->commitBarriers();
 
     ffx::DispatchDescNss desc{};
     desc.commandList            = commandList->getNativeObject(nvrhi::ObjectTypes::VK_CommandBuffer).pointer;
-    desc.color                  = WrapTexture(in.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    desc.color                  = WrapTexture(frameIn.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     desc.depth                  = WrapTexture(m_DepthR32, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    desc.motionVectors          = WrapTexture(in.motionVectors, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    desc.motionVectors          = WrapTexture(frameIn.motionVectors, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     desc.output                 = WrapTexture(in.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     // NSS's jitter is the negative of donut's pixel offset on both axes (measured: static-scene PSNR vs DLSS
     // 38 dB with (-1,-1) against 29-32 dB for the other sign combinations). NSS_JITTER_SIGN="sx,sy" overrides.
@@ -350,7 +358,7 @@ void NSSWrapper::Evaluate(nvrhi::IDevice* device, nvrhi::ICommandList* commandLi
         if (const char* env = getenv("NSS_JITTER_SIGN"))
             sscanf(env, "%f,%f", &jitterSign[0], &jitterSign[1]);
     }
-    desc.jitterOffset = {jitterSign[0] * in.jitterOffset.x, jitterSign[1] * in.jitterOffset.y};
+    desc.jitterOffset = {jitterSign[0] * frameIn.jitterOffset.x, jitterSign[1] * frameIn.jitterOffset.y};
     desc.renderSize             = {uint32_t(renderSize.x), uint32_t(renderSize.y)};
     desc.upscaleSize            = {uint32_t(m_Settings.displaySize.x), uint32_t(m_Settings.displaySize.y)};
     desc.cameraNear             = in.cameraNear;
@@ -367,9 +375,20 @@ void NSSWrapper::Evaluate(nvrhi::IDevice* device, nvrhi::ICommandList* commandLi
             sscanf(env, "%f,%f", &mvScale[0], &mvScale[1]);
     }
     desc.motionVectorScale = {mvScale[0], mvScale[1]};
-    desc.frameTimeDelta         = in.frameTimeMs;
-    desc.reset                  = in.reset;
+    desc.frameTimeDelta         = frameIn.frameTimeMs;
+    desc.reset                  = frameIn.reset;
     (void)colorDesc;
+
+    // NSS_RECORD_DIR: per-frame parameters for a later replay (the capture writes the textures, see StreamlineSample).
+    if (const char* recordDir = getenv("NSS_RECORD_DIR"))
+    {
+        if (FILE* f = fopen((std::string(recordDir) + "/params.txt").c_str(), m_EvalIndex == 0 ? "w" : "a"))
+        {
+            fprintf(f, "%u %.9g %.9g %d %.9g\n", m_EvalIndex, in.jitterOffset.x, in.jitterOffset.y, in.reset ? 1 : 0, in.frameTimeMs);
+            fclose(f);
+        }
+    }
+    ++m_EvalIndex;
 
     ffxContext context = reinterpret_cast<ffxContext>(m_Context);
     if (ffx::Dispatch(context, desc) != ffx::ReturnCode::Ok)
@@ -377,6 +396,91 @@ void NSSWrapper::Evaluate(nvrhi::IDevice* device, nvrhi::ICommandList* commandLi
 
     // The SDK recorded raw Vulkan commands; make nvrhi re-emit its bindings.
     commandList->clearState();
+}
+
+// Loads one recorded texture (header {width, height} + tightly packed rows, as the capture's dumpTexture writes it).
+static bool LoadRecorded(const std::string& path, uint32_t bytesPerPixel, uint32_t& width, uint32_t& height, std::vector<uint8_t>& data)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    uint32_t header[2] = {};
+    bool     ok        = fread(header, sizeof(header), 1, f) == 1;
+    width              = header[0];
+    height             = header[1];
+    data.resize(size_t(width) * height * bytesPerPixel);
+    ok = ok && fread(data.data(), 1, data.size(), f) == data.size();
+    fclose(f);
+    return ok;
+}
+
+bool NSSWrapper::ReplayInputs(nvrhi::IDevice* device, nvrhi::ICommandList* commandList, const Inputs& in, Inputs& out)
+{
+    const char* dir = getenv("NSS_REPLAY_DIR");
+    if (!dir)
+        return false;
+    char name[64];
+    auto path = [&](const char* prefix) {
+        snprintf(name, sizeof(name), "/%s_%04u.bin", prefix, m_EvalIndex);
+        return std::string(dir) + name;
+    };
+
+    // Parameters: the line for m_EvalIndex in params.txt.
+    FILE* pf = fopen((std::string(dir) + "/params.txt").c_str(), "r");
+    if (!pf)
+        return false;
+    bool     found = false;
+    unsigned idx   = 0;
+    float    jx = 0, jy = 0, frameTime = 0;
+    int      reset = 0;
+    while (fscanf(pf, "%u %f %f %d %f", &idx, &jx, &jy, &reset, &frameTime) == 5)
+    {
+        if (idx == m_EvalIndex)
+        {
+            found = true;
+            break;
+        }
+    }
+    fclose(pf);
+
+    std::vector<uint8_t> color, motion, depth;
+    uint32_t             w = 0, h = 0, mw = 0, mh = 0, dw = 0, dh = 0;
+    if (!found || !LoadRecorded(path("input"), 8, w, h, color) || !LoadRecorded(path("mv"), 4, mw, mh, motion) ||
+        !LoadRecorded(path("depth"), 4, dw, dh, depth))
+    {
+        donut::log::warning("NSS replay: no recorded frame %u in %s", m_EvalIndex, dir);
+        return false;
+    }
+
+    auto ensure = [&](nvrhi::TextureHandle& tex, nvrhi::ITexture* like, const char* debugName) {
+        const nvrhi::TextureDesc& ld = like->getDesc();
+        if (tex && tex->getDesc().width == ld.width && tex->getDesc().height == ld.height && tex->getDesc().format == ld.format)
+            return;
+        nvrhi::TextureDesc desc = ld;
+        desc.isRenderTarget     = false;
+        desc.isUAV              = false;
+        desc.isVirtual          = false;
+        desc.useClearValue      = false;
+        desc.sampleCount        = 1;
+        desc.dimension          = nvrhi::TextureDimension::Texture2D;
+        desc.initialState       = nvrhi::ResourceStates::ShaderResource;
+        desc.keepInitialState   = true;
+        desc.debugName          = debugName;
+        tex                     = device->createTexture(desc);
+    };
+    ensure(m_ReplayColor, in.color, "NSS replay colour");
+    ensure(m_ReplayMotion, in.motionVectors, "NSS replay motion");
+    commandList->writeTexture(m_ReplayColor, 0, 0, color.data(), size_t(w) * 8);
+    commandList->writeTexture(m_ReplayMotion, 0, 0, motion.data(), size_t(mw) * 4);
+    commandList->writeTexture(m_DepthR32, 0, 0, depth.data(), size_t(dw) * 4);
+
+    out               = in;
+    out.color         = m_ReplayColor;
+    out.motionVectors = m_ReplayMotion;
+    out.jitterOffset  = {jx, jy};
+    out.reset         = reset != 0;
+    out.frameTimeMs   = frameTime;
+    return true;
 }
 
 void NSSWrapper::Shutdown()
@@ -397,4 +501,6 @@ void NSSWrapper::Release()
     m_DepthCopyLayout   = nullptr;
     m_DepthCopyShader   = nullptr;
     m_DepthR32          = nullptr;
+    m_ReplayColor       = nullptr;
+    m_ReplayMotion      = nullptr;
 }

@@ -1480,7 +1480,8 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
 
     // Benchmark: GPU time of everything the upscaler records (DLSS through Streamline, an injected replacement, NSS).
     const int timerSlot = m_CaptureAppFrame % kTimerRing;
-    const bool timeUpscaler = IsCapturing() && m_ScriptingConfig.benchmark;
+    // Also on for plain captures: HelixSR Scaler's Vulkan bridge crashes on the capture path without them.
+    const bool timeUpscaler = IsCapturing();
     if (timeUpscaler)
     {
         if (!m_UpscaleTimers[timerSlot])
@@ -1836,6 +1837,12 @@ void StreamlineSample::RenderScene(nvrhi::IFramebuffer* framebuffer)
                 if (m_ui.AAMode == AntiAliasingMode::NSS && NSSWrapper::Get().GetDepthCopy())
                     dumpTexture(NSSWrapper::Get().GetDepthCopy(), "depth", 4);
 #endif
+            }
+            // CAPTURE_DUMP_UPSCALED=1: raw RGBA16F upscaler output (display resolution), for bit-exact comparisons.
+            if (getenv("CAPTURE_DUMP_UPSCALED"))
+            {
+                dumpTexture(m_RenderTargets->AAResolvedColor, "upscaled", 8);
+                dumpTexture(m_RenderTargets->HdrColor, "input", 8);
             }
         }
         ++m_CaptureAppFrame;

@@ -68,6 +68,9 @@ public:
 private:
     NSSWrapper() = default;
     void EnsureDepthCopy(nvrhi::IDevice* device, donut::math::int2 size);
+    // NSS_REPLAY_DIR=<capture dir>: substitutes the inputs recorded by a capture run with NSS_RECORD_DIR set (params.txt)
+    // and CAPTURE_DUMP_UPSCALED + CAPTURE_DUMP_MV (input/mv/depth_NNNN.bin), so shader changes can be checked bit for bit.
+    bool ReplayInputs(nvrhi::IDevice* device, nvrhi::ICommandList* commandList, const Inputs& in, Inputs& out);
 
     void*       m_Context = nullptr;
     Settings    m_Settings{};
@@ -76,6 +79,9 @@ private:
     std::string m_Status      = "NSS: not initialised";
 
     nvrhi::TextureHandle         m_DepthR32;
+    nvrhi::TextureHandle         m_ReplayColor;
+    nvrhi::TextureHandle         m_ReplayMotion;
+    uint32_t                     m_EvalIndex = 0;
     nvrhi::ShaderHandle          m_DepthCopyShader;
     nvrhi::BindingLayoutHandle   m_DepthCopyLayout;
     nvrhi::ComputePipelineHandle m_DepthCopyPipeline;
